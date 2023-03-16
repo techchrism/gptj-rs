@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "ggml-raw",
+    "gptj-rs",
+]
+resolver = "2"
