@@ -2,5 +2,6 @@
 members = [
     "ggml-raw",
     "gptj-rs",
+    "gptj-cli",
 ]
 resolver = "2"
