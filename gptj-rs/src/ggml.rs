@@ -106,6 +106,11 @@ impl Context {
         self.new_tensor_raw(tensor)
     }
 
+    pub fn op_gelu(&self, a: &Tensor) -> Tensor {
+        let tensor = unsafe { ggml_raw::ggml_gelu(self.ptr.as_ptr(), a.ptr.as_ptr()) };
+        self.new_tensor_raw(tensor)
+    }
+
     pub fn op_scale(&self, a: &Tensor, b: &Tensor) -> Tensor {
         let tensor =
             unsafe { ggml_raw::ggml_scale(self.ptr.as_ptr(), a.ptr.as_ptr(), b.ptr.as_ptr()) };
@@ -132,6 +137,12 @@ impl Context {
     pub fn op_cpy(&self, a: &Tensor, b: &Tensor) -> Tensor {
         let tensor =
             unsafe { ggml_raw::ggml_cpy(self.ptr.as_ptr(), a.ptr.as_ptr(), b.ptr.as_ptr()) };
+        self.new_tensor_raw(tensor)
+    }
+
+    pub fn op_transpose(&self, a: &Tensor) -> Tensor {
+        let tensor =
+            unsafe { ggml_raw::ggml_transpose(self.ptr.as_ptr(), a.ptr.as_ptr()) };
         self.new_tensor_raw(tensor)
     }
 

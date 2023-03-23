@@ -8,6 +8,7 @@ use std::{
 };
 
 use thiserror::Error;
+use fancy_regex::Regex;
 
 use partial_sort::PartialSort;
 use rand::{distributions::WeightedIndex, prelude::Distribution};
@@ -17,7 +18,6 @@ pub struct Hyperparameters {
     n_vocab: i32,
     n_ctx: i32,
     n_embd: i32,
-    n_mult: i32,
     n_head: i32,
     n_layer: i32,
     n_rot: i32,
@@ -25,29 +25,35 @@ pub struct Hyperparameters {
 }
 
 struct Layer {
-    attention_norm: ggml::Tensor,
-
-    wq: ggml::Tensor,
-    wk: ggml::Tensor,
-    wv: ggml::Tensor,
-    wo: ggml::Tensor,
-
     // normalization
-    ffn_norm: ggml::Tensor,
+    ln_1_g: ggml::Tensor,
+    ln_1_b: ggml::Tensor,
+
+    // attention
+    c_attn_q_proj_w: ggml::Tensor,
+    c_attn_k_proj_w: ggml::Tensor,
+    c_attn_v_proj_w: ggml::Tensor,
+
+    c_attn_proj_w: ggml::Tensor,
 
     // ff
-    w1: ggml::Tensor,
-    w2: ggml::Tensor,
-    w3: ggml::Tensor,
+    c_mlp_fc_w: ggml::Tensor,
+    c_mlp_fc_b: ggml::Tensor,
+    c_mlp_proj_w_trans: ggml::Tensor,
+    c_mlp_proj_b: ggml::Tensor,
 }
 
 pub struct Model {
     hparams: Hyperparameters,
 
-    tok_embeddings: ggml::Tensor,
+    // normalization
+    ln_f_g: ggml::Tensor,
+    ln_f_b: ggml::Tensor,
 
-    norm: ggml::Tensor,
-    output: ggml::Tensor,
+    tok_embeddings: ggml::Tensor, // wte
+
+    lmh_g: ggml::Tensor, // language model head
+    lmh_b: ggml::Tensor, // language model bias
 
     layers: Vec<Layer>,
 
@@ -113,16 +119,6 @@ impl Display for OutputToken<'_> {
     }
 }
 
-fn llama_n_parts(size: i32) -> i32 {
-    match size {
-        4096 => 1,
-        5120 => 2,
-        6656 => 4,
-        8192 => 8,
-        _ => unreachable!("Invalid size for N_PARTS"),
-    }
-}
-
 /// Each variant represents a step within the process of loading the model.
 /// These can be used to report progress to the user.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -138,21 +134,14 @@ pub enum LoadProgress<'a> {
         bytes: usize,
         n_mem: usize,
     },
-    PartLoading {
-        file: &'a Path,
-        current_part: usize,
-        total_parts: usize,
-    },
-    PartTensorLoaded {
-        file: &'a Path,
+    TensorLoading {
         current_tensor: usize,
         tensor_count: usize,
     },
-    PartLoaded {
-        file: &'a Path,
-        byte_size: usize,
+    TensorLoaded {
+        current_tensor: usize,
         tensor_count: usize,
-    },
+    }
 }
 
 #[derive(Error, Debug)]
@@ -177,6 +166,8 @@ pub enum LoadError {
 
     #[error("invalid magic number for {path:?}")]
     InvalidMagic { path: PathBuf },
+    #[error("invalid vocab length in model (expected {n_vocab}, got {vocab_len})")]
+    VocabLengthMismatch { n_vocab: i32, vocab_len: i32 },
     #[error("invalid value {value} for `f16` in hyperparameters")]
     HyperparametersF16Invalid { value: i32 },
     #[error("unknown tensor `{tensor_name}` in {path:?}")]
@@ -190,7 +181,6 @@ pub enum LoadError {
 impl Model {
     pub fn load(
         path: impl AsRef<Path>,
-        n_ctx: i32,
         load_progress_callback: impl Fn(LoadProgress),
     ) -> Result<(Model, Vocabulary), LoadError> {
         use std::fs::File;
@@ -247,18 +237,13 @@ impl Model {
         // in this order.
         let hparams = Hyperparameters {
             n_vocab: read_i32(&mut reader)?,
-            n_ctx,
+            n_ctx: read_i32(&mut reader)?,
             n_embd: read_i32(&mut reader)?,
-            n_mult: read_i32(&mut reader)?,
             n_head: read_i32(&mut reader)?,
             n_layer: read_i32(&mut reader)?,
             n_rot: read_i32(&mut reader)?,
             f16_: read_i32(&mut reader)?,
         };
-
-        let n_ff =
-            ((2 * (4 * hparams.n_embd) / 3 + hparams.n_mult - 1) / hparams.n_mult) * hparams.n_mult;
-        let n_parts = llama_n_parts(hparams.n_embd);
 
         load_progress_callback(LoadProgress::HyperParamsLoaded(&hparams));
 
@@ -266,14 +251,18 @@ impl Model {
         // Load vocabulary
         // ===============
         let mut vocab = Vocabulary::default();
+        let vocab_len = read_i32(&mut reader)?;
+        if vocab_len != hparams.n_vocab {
+            return Err(LoadError::VocabLengthMismatch { n_vocab: hparams.n_vocab, vocab_len });
+        }
         for i in 0..hparams.n_vocab {
             let len = read_i32(&mut reader)?;
             if let Ok(word) = read_string(&mut reader, len as usize) {
                 vocab.mapping.push(word);
             } else {
-                load_progress_callback(LoadProgress::BadToken {
+                /*load_progress_callback(LoadProgress::BadToken {
                     index: i.try_into()?,
-                });
+                });*/
                 vocab.mapping.push("�".to_string());
             }
         }
@@ -300,7 +289,6 @@ impl Model {
             let n_layer = n_layer as u64;
             let n_ctx = n_ctx as u64;
             let n_vocab = n_vocab as u64;
-            let n_ff = n_ff as u64;
 
             /// NOTE: The original code relies in promotion rules and automatic
             /// cast between int to float. What we do instead is use this macro
@@ -322,24 +310,28 @@ impl Model {
 
             let mut ctx_size: u64 = 0;
 
-            ctx_size += mul!(n_embd, n_vocab, ggml_type_sizef(wtype)); // tok_embeddings
+            ctx_size += mul!(n_embd, ggml_type_sizef(ggml::TYPE_F32)); // ln_f_g
+            ctx_size += mul!(n_embd, ggml_type_sizef(ggml::TYPE_F32)); // ln_f_b
 
-            ctx_size += mul!(n_embd, ggml_type_sizef(ggml::TYPE_F32)); // norm
+            ctx_size += mul!(n_embd, n_vocab, ggml_type_sizef(wtype)); // wte
 
-            ctx_size += mul!(n_embd, n_vocab, ggml_type_sizef(wtype)); // output
+            ctx_size += mul!(n_embd, n_vocab, ggml_type_sizef(wtype)); // Lmh_g
+            ctx_size += mul!(n_vocab, ggml_type_sizef(ggml::TYPE_F32)); // Lmh_b
 
-            ctx_size += mul!(n_layer, n_embd, ggml_type_sizef(ggml::TYPE_F32)); // attention_norm
+            ctx_size += mul!(n_layer, n_embd, ggml_type_sizef(ggml::TYPE_F32)); // ln_1_g
+            ctx_size += mul!(n_layer, n_embd, ggml_type_sizef(ggml::TYPE_F32)); // ln_1_b
 
-            ctx_size += mul!(n_layer, n_embd, n_embd, ggml_type_sizef(wtype)); // wq
-            ctx_size += mul!(n_layer, n_embd, n_embd, ggml_type_sizef(wtype)); // wk
-            ctx_size += mul!(n_layer, n_embd, n_embd, ggml_type_sizef(wtype)); // wv
-            ctx_size += mul!(n_layer, n_embd, n_embd, ggml_type_sizef(wtype)); // wo
+            ctx_size += mul!(n_layer, n_embd, n_embd, ggml_type_sizef(wtype)); // c_attn_q_proj_w
+            ctx_size += mul!(n_layer, n_embd, n_embd, ggml_type_sizef(wtype)); // c_attn_k_proj_w
+            ctx_size += mul!(n_layer, n_embd, n_embd, ggml_type_sizef(wtype)); // c_attn_v_proj_w
 
-            ctx_size += mul!(n_layer, n_embd, ggml_type_sizef(ggml::TYPE_F32)); // ffn_norm
+            ctx_size += mul!(n_layer, n_embd, n_embd, ggml_type_sizef(wtype)); // c_attn_proj_w
 
-            ctx_size += mul!(n_layer, n_ff, n_embd, ggml_type_sizef(wtype)); // w1
-            ctx_size += mul!(n_layer, n_ff, n_embd, ggml_type_sizef(wtype)); // w2
-            ctx_size += mul!(n_layer, n_ff, n_embd, ggml_type_sizef(wtype)); // w3
+            ctx_size += mul!(n_layer, 4, n_embd, n_embd, ggml_type_sizef(wtype)); // c_mlp_fc_w
+            ctx_size += mul!(n_layer, 4, n_embd, ggml_type_sizef(ggml::TYPE_F32)); // c_mlp_fc_b
+
+            ctx_size += mul!(n_layer, 4, n_embd, n_embd, ggml_type_sizef(wtype)); // c_mlp_proj_w_trans
+            ctx_size += mul!(n_layer, n_embd, ggml_type_sizef(ggml::TYPE_F32)); // c_mlp_proj_b
 
             ctx_size += mul!(n_ctx, n_layer, n_embd, ggml_type_sizef(ggml::TYPE_F32)); // memory_k
             ctx_size += mul!(n_ctx, n_layer, n_embd, ggml_type_sizef(ggml::TYPE_F32)); // memory_v
@@ -359,55 +351,50 @@ impl Model {
         let model = {
             let mut tensors = HashMap::new();
 
+            // wte
             let tok_embeddings = context.new_tensor_2d(wtype, n_embd, n_vocab);
-            let norm = context.new_tensor_1d(ggml::TYPE_F32, n_embd);
-            let output = context.new_tensor_2d(wtype, n_embd, n_vocab);
 
-            tensors.insert("tok_embeddings.weight".to_owned(), tok_embeddings.share());
-            tensors.insert("norm.weight".to_owned(), norm.share());
-            tensors.insert("output.weight".to_owned(), output.share());
+            let ln_f_g = context.new_tensor_1d(ggml::TYPE_F32, n_embd);
+            let ln_f_b = context.new_tensor_1d(ggml::TYPE_F32, n_embd);
+
+            let lmh_g = context.new_tensor_2d(wtype, n_embd, n_vocab);
+            let lmh_b = context.new_tensor_1d(ggml::TYPE_F32, n_vocab);
+
+            tensors.insert("transformer.wte.weight".to_owned(), tok_embeddings.share());
+            tensors.insert("transformer.ln_f.weight".to_owned(), ln_f_g.share());
+            tensors.insert("transformer.ln_f.bias".to_owned(), ln_f_b.share());
+            tensors.insert("lm_head.weight".to_owned(), lmh_g.share());
+            tensors.insert("lm_head.bias".to_owned(), lmh_b.share());
 
             let mut layers = Vec::new();
             for i in 0..n_layer {
                 let layer = Layer {
-                    attention_norm: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
-                    wq: context.new_tensor_2d(wtype, n_embd, n_embd),
-                    wk: context.new_tensor_2d(wtype, n_embd, n_embd),
-                    wv: context.new_tensor_2d(wtype, n_embd, n_embd),
-                    wo: context.new_tensor_2d(wtype, n_embd, n_embd),
-                    ffn_norm: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
-                    w1: context.new_tensor_2d(wtype, n_embd, n_ff),
-                    w2: context.new_tensor_2d(wtype, n_ff, n_embd),
-                    w3: context.new_tensor_2d(wtype, n_embd, n_ff),
+                    ln_1_g: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
+                    ln_1_b: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
+                    c_attn_q_proj_w: context.new_tensor_2d(wtype, n_embd, n_embd),
+                    c_attn_k_proj_w: context.new_tensor_2d(wtype, n_embd, n_embd),
+                    c_attn_v_proj_w: context.new_tensor_2d(wtype, n_embd, n_embd),
+                    c_attn_proj_w: context.new_tensor_2d(wtype, n_embd, n_embd),
+                    c_mlp_fc_w:  context.new_tensor_2d(wtype, 4 * n_embd, n_embd),
+                    c_mlp_fc_b: context.new_tensor_1d(ggml::TYPE_F32, 4 * n_embd),
+                    c_mlp_proj_w_trans: context.new_tensor_2d(wtype, 4 * n_embd, n_embd),
+                    c_mlp_proj_b: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
                 };
 
-                tensors.insert(
-                    format!("layers.{i}.attention_norm.weight"),
-                    layer.attention_norm.share(),
-                );
+                tensors.insert(format!("transformer.h.{i}.ln_1.weight"), layer.ln_1_g.share());
+                tensors.insert(format!("transformer.h.{i}.ln_1.bias"), layer.ln_1_b.share());
 
-                tensors.insert(format!("layers.{i}.attention.wq.weight"), layer.wq.share());
-                tensors.insert(format!("layers.{i}.attention.wk.weight"), layer.wk.share());
-                tensors.insert(format!("layers.{i}.attention.wv.weight"), layer.wv.share());
-                tensors.insert(format!("layers.{i}.attention.wo.weight"), layer.wo.share());
+                tensors.insert(format!("transformer.h.{i}.attn.q_proj.weight"), layer.c_attn_q_proj_w.share());
+                tensors.insert(format!("transformer.h.{i}.attn.k_proj.weight"), layer.c_attn_k_proj_w.share());
+                tensors.insert(format!("transformer.h.{i}.attn.v_proj.weight"), layer.c_attn_v_proj_w.share());
 
-                tensors.insert(
-                    format!("layers.{i}.ffn_norm.weight"),
-                    layer.ffn_norm.share(),
-                );
+                tensors.insert(format!("transformer.h.{i}.attn.out_proj.weight"), layer.c_attn_proj_w.share());
 
-                tensors.insert(
-                    format!("layers.{i}.feed_forward.w1.weight"),
-                    layer.w1.share(),
-                );
-                tensors.insert(
-                    format!("layers.{i}.feed_forward.w2.weight"),
-                    layer.w2.share(),
-                );
-                tensors.insert(
-                    format!("layers.{i}.feed_forward.w3.weight"),
-                    layer.w3.share(),
-                );
+                tensors.insert(format!("transformer.h.{i}.mlp.fc_in.weight"), layer.c_mlp_fc_w.share());
+                tensors.insert(format!("transformer.h.{i}.mlp.fc_in.bias"), layer.c_mlp_fc_b.share());
+
+                tensors.insert(format!("transformer.h.{i}.mlp.fc_out.weight"), layer.c_mlp_proj_w_trans.share());
+                tensors.insert(format!("transformer.h.{i}.mlp.fc_out.bias"), layer.c_mlp_proj_b.share());
 
                 layers.push(layer);
             }
@@ -428,9 +415,11 @@ impl Model {
 
             Model {
                 hparams,
+                ln_f_g,
+                ln_f_b,
                 tok_embeddings,
-                norm,
-                output,
+                lmh_g,
+                lmh_b,
                 layers,
                 memory_k,
                 memory_v,
@@ -439,259 +428,108 @@ impl Model {
             }
         };
 
-        // Close the file, but keep its offset. That way we know how to skip the
-        // metadata when loading the parts.
-        let file_offset = reader.stream_position()?;
-        drop(reader);
+        let mut total_size = 0;
+        let mut n_tensors = 0;
 
-        for i in 0..n_parts {
-            let part_id = i;
-
-            let part_path = if i > 0 {
-                let mut path = path.to_owned();
-                let mut filename = path.components().last().unwrap().as_os_str().to_owned();
-                filename.push(&format!(".{i}"));
-                path.pop();
-                path.join(filename)
-            } else {
-                path.to_path_buf()
-            };
-
-            load_progress_callback(LoadProgress::PartLoading {
-                file: &part_path,
-                current_part: (i + 1).try_into()?,
-                total_parts: n_parts.try_into()?,
+        // Load weights
+        loop {
+            load_progress_callback(LoadProgress::TensorLoading {
+                current_tensor: n_tensors.try_into()?,
+                tensor_count: model.tensors.len(),
             });
 
-            let mut part_reader = BufReader::new(File::open(&part_path)?);
+            // NOTE: Implementation from #![feature(buf_read_has_data_left)]
+            let is_eof = reader.fill_buf().map(|b| b.is_empty())?;
 
-            // Skip metadata
-            part_reader.seek(SeekFrom::Start(file_offset))?;
+            if is_eof {
+                break;
+            }
 
-            let mut total_size = 0;
-            let mut n_tensors = 0;
+            let n_dims = read_i32(&mut reader)?;
+            let length = read_i32(&mut reader)?;
+            let ftype = read_i32(&mut reader)?;
 
-            // Load weights
-            loop {
-                // NOTE: Implementation from #![feature(buf_read_has_data_left)]
-                let is_eof = part_reader.fill_buf().map(|b| b.is_empty())?;
+            let mut nelements = 1;
+            let mut ne = [1i32, 1i32];
+            for i in 0..n_dims {
+                ne[i as usize] = read_i32(&mut reader)?;
+                nelements *= ne[i as usize];
+            }
 
-                if is_eof {
-                    break;
-                }
+            let tensor_name = read_string(&mut reader, length as usize)?;
 
-                let n_dims = read_i32(&mut part_reader)?;
-                let length = read_i32(&mut part_reader)?;
-                let ftype = read_i32(&mut part_reader)?;
-
-                let mut nelements = 1;
-                let mut ne = [1i32, 1i32];
-                for i in 0..n_dims {
-                    ne[i as usize] = read_i32(&mut part_reader)?;
-                    nelements *= ne[i as usize];
-                }
-
-                let tensor_name = read_string(&mut part_reader, length as usize)?;
-
-                let Some(tensor) = model.tensors.get(&tensor_name)
-                    else {
-                        return Err(LoadError::UnknownTensor { tensor_name, path: part_path });
-                    };
-
-                // split_type = 0: split by columns
-                // split_type = 1: split by rows
-                //
-                // split_type = 0:
-                // regex:
-                //   - tok_embeddings.*
-                //   - layers.*.attention.wo.weight
-                //   - layers.*.feed_forward.w2.weight
-
-                // split_type = 1:
-                // regex:
-                //   - output.*
-                //   - layers.*.attention.wq.weight
-                //   - layers.*.attention.wk.weight
-                //   - layers.*.attention.wv.weight
-                //   - layers.*.feed_forward.w1.weight
-                //   - layers.*.feed_forward.w3.weight
-                #[allow(clippy::if_same_then_else)]
-                    let split_type = if tensor_name.contains("tok_embeddings") {
-                    0
-                } else if tensor_name.contains("layers") {
-                    if tensor_name.contains("attention.wo.weight") {
-                        0
-                    } else if tensor_name.contains("feed_forward.w2.weight") {
-                        0
-                    } else {
-                        1
-                    }
-                } else if tensor_name.contains("output") {
-                    1
-                } else {
-                    0
+            let Some(tensor) = model.tensors.get(&tensor_name)
+                else {
+                    return Err(LoadError::UnknownTensor { tensor_name, path: path.to_path_buf() });
                 };
 
-                if n_dims == 1 {
-                    if tensor.nelements() != nelements {
-                        return Err(LoadError::TensorWrongSize {
-                            tensor_name,
-                            path: part_path,
-                        });
-                    }
-                } else {
-                    if tensor.nelements() / n_parts != nelements {
-                        return Err(LoadError::TensorWrongSize {
-                            tensor_name,
-                            path: part_path,
-                        });
-                    }
-                }
-
-                if n_dims == 1 {
-                    if tensor.get_ne()[0] != ne[0] || tensor.get_ne()[1] != ne[1] {
-                        return Err(LoadError::TensorWrongSize {
-                            tensor_name,
-                            path: part_path,
-                        });
-                    }
-                } else {
-                    if split_type == 0 {
-                        if tensor.get_ne()[0] / n_parts != ne[0] || tensor.get_ne()[1] != ne[1] {
-                            return Err(LoadError::TensorWrongSize {
-                                tensor_name,
-                                path: part_path,
-                            });
-                        }
-                    } else {
-                        if tensor.get_ne()[0] != ne[0] || tensor.get_ne()[1] / n_parts != ne[1] {
-                            return Err(LoadError::TensorWrongSize {
-                                tensor_name,
-                                path: part_path,
-                            });
-                        }
-                    }
-                }
-
-                fn ggml_type_size(t: ggml::Type) -> usize {
-                    unsafe { ggml_raw::ggml_type_size(t) }
-                }
-
-                fn ggml_blck_size(t: ggml::Type) -> i32 {
-                    unsafe { ggml_raw::ggml_blck_size(t) }
-                }
-
-                let bpe = match ftype {
-                    0 => ggml_type_size(ggml::TYPE_F32),
-                    1 => ggml_type_size(ggml::TYPE_F16),
-                    2 => {
-                        assert_eq!(ne[0] % 64, 0);
-                        ggml_type_size(ggml::TYPE_Q4_0)
-                    }
-                    3 => {
-                        assert_eq!(ne[0] % 64, 0);
-                        ggml_type_size(ggml::TYPE_Q4_1)
-                    }
-                    _ => {
-                        return Err(LoadError::InvalidFtype {
-                            ftype,
-                            path: part_path,
-                        })
-                    }
-                };
-
-                if n_dims == 1 || n_parts == 1 {
-                    if (nelements as usize * bpe) / ggml_blck_size(tensor.get_type()) as usize
-                        != tensor.nbytes()
-                    {
-                        return Err(LoadError::TensorWrongSize {
-                            tensor_name,
-                            path: part_path,
-                        });
-                    }
-
-                    let data = tensor.data();
-
-                    if part_id == 0 {
-                        // SAFETY: yolo, same as original code
-                        let slice = unsafe {
-                            std::slice::from_raw_parts_mut(data as *mut u8, tensor.nbytes())
-                        };
-                        part_reader.read_exact(slice)?;
-                    } else {
-                        part_reader.seek(SeekFrom::Current(tensor.nbytes() as i64))?;
-                    }
-
-                    total_size += tensor.nbytes();
-                } else {
-                    if (nelements as usize * bpe) / ggml_blck_size(tensor.get_type()) as usize
-                        != tensor.nbytes() / n_parts as usize
-                    {
-                        return Err(LoadError::TensorWrongSize {
-                            tensor_name,
-                            path: part_path,
-                        });
-                    }
-
-                    if split_type == 0 {
-                        let np0 = ne[0];
-                        let row_size = (tensor.get_ne()[0] / ggml_blck_size(tensor.get_type()))
-                            as usize
-                            * ggml_type_size(tensor.get_type());
-
-                        assert_eq!(row_size, tensor.get_nb()[1]);
-
-                        for i1 in 0..ne[1] {
-                            let offset_row = i1 as usize * row_size;
-                            let offset = offset_row
-                                + ((part_id * np0) as usize
-                                / ggml_blck_size(tensor.get_type()) as usize)
-                                * ggml_type_size(tensor.get_type());
-                            // SAFETY: yolo, same as original code
-                            unsafe {
-                                let ptr = tensor.data().add(offset);
-                                let slice = std::slice::from_raw_parts_mut(
-                                    ptr as *mut u8,
-                                    row_size / n_parts as usize,
-                                );
-                                part_reader.read_exact(slice)?;
-                            }
-                        }
-                    } else {
-                        let np1 = ne[1];
-                        let row_size = (tensor.get_ne()[0] / ggml_blck_size(tensor.get_type()))
-                            as usize
-                            * ggml_type_size(tensor.get_type());
-
-                        for i1 in 0..ne[1] {
-                            let offset_row = (i1 + part_id * np1) as usize * row_size;
-                            // SAFETY: yolo, same as original code
-                            unsafe {
-                                let ptr = tensor.data().add(offset_row);
-                                let slice =
-                                    std::slice::from_raw_parts_mut(ptr as *mut u8, row_size);
-                                part_reader.read_exact(slice)?;
-                            }
-                        }
-                    }
-
-                    total_size += tensor.nbytes() / n_parts as usize
-                }
-
-                n_tensors += 1;
-                load_progress_callback(LoadProgress::PartTensorLoaded {
-                    file: &part_path,
-                    current_tensor: n_tensors.try_into()?,
-                    tensor_count: model.tensors.len(),
+            if tensor.nelements() != nelements {
+                return Err(LoadError::TensorWrongSize {
+                    tensor_name,
+                    path: path.to_path_buf()
                 });
             }
 
-            load_progress_callback(LoadProgress::PartLoaded {
-                file: &part_path,
-                byte_size: total_size,
-                tensor_count: n_tensors.try_into()?,
+            if tensor.get_ne()[0] != ne[0] || tensor.get_ne()[1] != ne[1] {
+                return Err(LoadError::TensorWrongSize {
+                    tensor_name,
+                    path: path.to_path_buf()
+                });
+            }
+
+            fn ggml_type_size(t: ggml::Type) -> usize {
+                unsafe { ggml_raw::ggml_type_size(t) }
+            }
+
+            fn ggml_blck_size(t: ggml::Type) -> i32 {
+                unsafe { ggml_raw::ggml_blck_size(t) }
+            }
+
+            let bpe = match ftype {
+                0 => ggml_type_size(ggml::TYPE_F32),
+                1 => ggml_type_size(ggml::TYPE_F16),
+                2 => {
+                    assert_eq!(ne[0] % 64, 0);
+                    ggml_type_size(ggml::TYPE_Q4_0)
+                }
+                3 => {
+                    assert_eq!(ne[0] % 64, 0);
+                    ggml_type_size(ggml::TYPE_Q4_1)
+                }
+                _ => {
+                    return Err(LoadError::InvalidFtype {
+                        ftype,
+                        path: path.to_path_buf()
+                    })
+                }
+            };
+
+            if (nelements as usize * bpe) / ggml_blck_size(tensor.get_type()) as usize
+                != tensor.nbytes()
+            {
+                return Err(LoadError::TensorWrongSize {
+                    tensor_name,
+                    path: path.to_path_buf()
+                });
+            }
+
+            let data = tensor.data();
+
+            // SAFETY: yolo, same as original code
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut(data as *mut u8, tensor.nbytes())
+            };
+            reader.read_exact(slice)?;
+
+            load_progress_callback(LoadProgress::TensorLoaded {
+                current_tensor: n_tensors.try_into()?,
+                tensor_count: model.tensors.len(),
             });
+            total_size += tensor.nbytes();
+            n_tensors += 1;
         }
+
+        drop(reader);
 
         Ok((model, vocab))
     }
@@ -704,7 +542,7 @@ impl Model {
         rng: &mut impl rand::Rng,
         callback: impl Fn(OutputToken),
     ) {
-        let embd_inp = self.tokenize(vocab, prompt, true);
+        let embd_inp = self.tokenize(vocab, prompt);
         let mut logits = Vec::new();
 
         // determine the required inference memory per token:
@@ -903,14 +741,13 @@ impl Model {
             n_vocab,
             n_ctx,
             n_embd,
-            n_mult: _,
             n_head,
             n_layer,
             n_rot,
             f16_: _,
         } = self.hparams;
 
-        let mut buf_size = 512 * 1024 * 1024;
+        let mut buf_size = 256 * 1024 * 1024;
         if *mem_per_token > 0 && *mem_per_token * N > buf_size {
             // add 10% to account for ggml object overhead
             buf_size = (1.1f64 * *mem_per_token as f64 * N as f64) as usize;
@@ -925,22 +762,26 @@ impl Model {
         let mut inpL = ctx0.op_get_rows(&self.tok_embeddings, &embd);
 
         for il in 0..n_layer as usize {
-            let inpSA = inpL.share();
             let mut cur: ggml::Tensor;
 
             // norm
             {
                 cur = ctx0.op_norm(&inpL);
 
-                // cur = attention_norm * cur
-                cur = ctx0.op_mul(&ctx0.op_repeat(&self.layers[il].attention_norm, &cur), &cur);
+                // cur = ln_1_g*cur + ln_1_b
+                cur = ctx0.op_add(
+                    &ctx0.op_mul(&ctx0.op_repeat(&self.layers[il].ln_1_g, &cur), &cur),
+                    &ctx0.op_repeat(&self.layers[il].ln_1_b, &cur)
+                );
             }
+
+            let inpSA = cur.share();
 
             // self-attention
             {
-                let Qcur = ctx0.op_mul_mat(&self.layers[il].wq, &cur);
-                let Kcur = ctx0.op_mul_mat(&self.layers[il].wk, &cur);
-                let Vcur = ctx0.op_mul_mat(&self.layers[il].wv, &cur);
+                let Qcur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_attn_q_proj_w), &cur);
+                let Kcur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_attn_k_proj_w), &cur);
+                let Vcur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_attn_v_proj_w), &cur);
 
                 // store key and value to memory
                 if N >= 1 {
@@ -973,10 +814,7 @@ impl Model {
                         n_rot,
                         0,
                     ),
-                    0,
-                    2,
-                    1,
-                    3,
+                    0, 2, 1, 3,
                 );
 
                 // K = Kmem.view(n_embd/n_head, n_head, n_past + N).permute(0, 2, 1, 3)
@@ -998,10 +836,7 @@ impl Model {
                         n_rot,
                         1,
                     ),
-                    0,
-                    2,
-                    1,
-                    3,
+                    0, 2, 1, 3,
                 );
 
                 // K * Q
@@ -1050,50 +885,50 @@ impl Model {
                 );
 
                 // projection (no bias)
-                cur = ctx0.op_mul_mat(&self.layers[il].wo, &cur);
+                cur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_attn_proj_w), &cur);
             }
 
-            let inpFF = ctx0.op_add(&cur, &inpSA);
+            //let inpFF = ctx0.op_add(&cur, &inpSA);
+            let inpFF = cur.share();
 
             // feed-forward network
             {
-                // norm
-                {
-                    cur = ctx0.op_norm(&inpFF);
+                // note here we pass inpSA instead of cur
+                cur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_mlp_fc_w), &inpSA);
+                cur = ctx0.op_add(&ctx0.op_repeat(&self.layers[il].c_mlp_fc_b, &cur), &cur);
 
-                    // cur = ffn_norm*cur
-                    cur = ctx0.op_mul(&ctx0.op_repeat(&self.layers[il].ffn_norm, &cur), &cur);
-                }
+                // GELU activation
+                cur = ctx0.op_gelu(&cur);
 
-                let tmp = ctx0.op_mul_mat(&self.layers[il].w3, &cur);
-
-                cur = ctx0.op_mul_mat(&self.layers[il].w1, &cur);
-
-                // SILU activation
-                cur = ctx0.op_silu(&cur);
-
-                cur = ctx0.op_mul(&cur, &tmp);
-
-                cur = ctx0.op_mul_mat(&self.layers[il].w2, &cur);
+                // projection
+                // cur = proj_w*cur + proj_b
+                cur = ctx0.op_mul_mat(&self.layers[il].c_mlp_proj_w_trans, &cur);
+                cur = ctx0.op_add(&ctx0.op_repeat(&self.layers[il].c_mlp_proj_b, &cur), &cur);
             }
 
+            // self-attention + FF
             cur = ctx0.op_add(&cur, &inpFF);
 
             // input for next layer
-            inpL = cur;
+            //inpL = cur;
+            inpL = ctx0.op_add(&cur, &inpL);
         }
 
         // norm
         {
             inpL = ctx0.op_norm(&inpL);
 
-            // inpL = norm*inpL
-            inpL = ctx0.op_mul(&ctx0.op_repeat(&self.norm, &inpL), &inpL);
+            // inpL = ln_f_g*inpL + ln_f_b
+            inpL = ctx0.op_add(
+                &ctx0.op_mul(&ctx0.op_repeat(&self.ln_f_g, &inpL), &inpL),
+                &ctx0.op_repeat(&self.ln_f_b, &inpL)
+            )
         }
 
         // lm_head
         {
-            inpL = ctx0.op_mul_mat(&self.output, &inpL);
+            inpL = ctx0.op_mul_mat(&self.lmh_g, &inpL);
+            inpL = ctx0.op_add(&ctx0.op_repeat(&self.lmh_b, &inpL), &inpL);
         }
 
         // logits -> probs
@@ -1118,39 +953,51 @@ impl Model {
         }
     }
 
-    pub fn tokenize(&self, vocab: &Vocabulary, text: &str, bos: bool) -> Vec<TokenId> {
-        let mut res = Vec::new();
-        if bos {
-            res.push(1 as TokenId); // TODO: replace with vocab.bos
-        }
+    pub fn tokenize(&self, vocab: &Vocabulary, text: &str) -> Vec<TokenId> {
+        // first split the text into words
+        let re = Regex::new(r#"('s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?\d+| ?[^\sA-Za-z\d]+|\s+(?!\S)|\s+)"#).unwrap();
+        let words: Vec<&str> = re.find_iter(text).map(|m| m.unwrap().as_str()).collect();
 
-        // Find the longest token that matches the text
-        let mut pos = 0;
-        loop {
-            let mut l = 0;
-            let mut t = 0;
-
-            for (tk_id, tk) in vocab.mapping.iter().enumerate() {
-                if tk.len() < l {
-                    continue;
-                }
-                if tk.len() > text.len() - pos {
-                    continue;
-                }
-                if text[pos..].starts_with(tk) {
-                    l = tk.len();
-                    t = tk_id;
-                }
+        // find the longest tokens that form the words:
+        let mut tokens: Vec<TokenId> = Vec::new();
+        for word in words.iter() {
+            if word.len() == 0 {
+                continue;
             }
 
-            if l == 0 {
-                break;
-            }
+            let mut i = 0;
+            let n = word.len();
+            while i < n {
+                let mut j = n;
+                while j > i {
+                    let search: &str = &word[i..j];
+                    let val = vocab.mapping.iter().enumerate().find(|(_tk_id, tk)| tk.as_str() == search);
+                    if val.is_none() {
+                        j -= 1;
+                    } else {
+                        tokens.push(val.unwrap().0 as TokenId);
+                        i = j;
+                        break;
+                    }
+                }
 
-            res.push(t as TokenId);
-            pos += l;
+                if i == n {
+                    break;
+                }
+
+                if j == i {
+                    let sub = &word[i..(i+1)];
+                    let val = vocab.mapping.iter().enumerate().find(|(_tk_id, tk)| tk.as_str() == sub);
+                    if val.is_none() {
+                        println!("Uh oh! Invalid token!");
+                    } else {
+                        tokens.push(val.unwrap().0 as TokenId);
+                    }
+                    i += 1;
+                }
+            }
         }
 
-        res
+        return tokens;
     }
 }
