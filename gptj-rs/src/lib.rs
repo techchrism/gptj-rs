@@ -3,7 +3,7 @@ mod ggml;
 use std::{
     collections::HashMap,
     fmt::Display,
-    io::{BufRead, Read, Seek, SeekFrom},
+    io::{BufRead, Read},
     path::{Path, PathBuf},
 };
 
@@ -273,8 +273,6 @@ impl Model {
         let wtype = match hparams.f16_ {
             0 => ggml::TYPE_F32,
             1 => ggml::TYPE_F16,
-            2 => ggml::TYPE_Q4_0,
-            3 => ggml::TYPE_Q4_1,
             invalid => return Err(LoadError::HyperparametersF16Invalid { value: invalid }),
         };
 
@@ -488,14 +486,6 @@ impl Model {
             let bpe = match ftype {
                 0 => ggml_type_size(ggml::TYPE_F32),
                 1 => ggml_type_size(ggml::TYPE_F16),
-                2 => {
-                    assert_eq!(ne[0] % 64, 0);
-                    ggml_type_size(ggml::TYPE_Q4_0)
-                }
-                3 => {
-                    assert_eq!(ne[0] % 64, 0);
-                    ggml_type_size(ggml::TYPE_Q4_1)
-                }
                 _ => {
                     return Err(LoadError::InvalidFtype {
                         ftype,

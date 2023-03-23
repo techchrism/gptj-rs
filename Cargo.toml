@@ -5,3 +5,5 @@ members = [
     "gptj-cli",
 ]
 resolver = "2"
+
+license = "MIT"

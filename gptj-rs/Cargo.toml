@@ -2,6 +2,10 @@
 name = "gptj-rs"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "A GPT-J inference library written in Rust"
+homepage = "https://github.com/techchrism/gptj-rs"
+repository = "https://github.com/techchrism/gptj-rs.git"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
