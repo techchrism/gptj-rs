@@ -231,10 +231,6 @@ impl Tensor {
         self.with_alive_ctx(|| unsafe { *self.ptr.as_ptr() }.ne)
     }
 
-    pub fn get_nb(&self) -> [usize; 4] {
-        self.with_alive_ctx(|| unsafe { *self.ptr.as_ptr() }.nb)
-    }
-
     pub fn get_type(&self) -> ggml_raw::ggml_type {
         self.with_alive_ctx(|| unsafe { *self.ptr.as_ptr() }.type_)
     }

@@ -60,12 +60,6 @@ fn main() {
                     bytes as f32 / 1024.0 / 1024.0,
                     n_mem
                 ),
-                LoadProgress::TensorLoading {
-                    current_tensor,
-                    tensor_count,
-                } => {
-
-                },
                 LoadProgress::TensorLoaded {
                     current_tensor,
                     tensor_count,
@@ -74,7 +68,8 @@ fn main() {
                     if current_tensor % 8 == 0 {
                         log::info!("Loaded tensor {current_tensor}/{tensor_count}");
                     }
-                }
+                },
+                _ => {}
             }
         })
             .expect("Could not load model");

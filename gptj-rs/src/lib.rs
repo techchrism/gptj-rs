@@ -255,7 +255,7 @@ impl Model {
         if vocab_len != hparams.n_vocab {
             return Err(LoadError::VocabLengthMismatch { n_vocab: hparams.n_vocab, vocab_len });
         }
-        for i in 0..hparams.n_vocab {
+        for _i in 0..hparams.n_vocab {
             let len = read_i32(&mut reader)?;
             if let Ok(word) = read_string(&mut reader, len as usize) {
                 vocab.mapping.push(word);
@@ -426,7 +426,6 @@ impl Model {
             }
         };
 
-        let mut total_size = 0;
         let mut n_tensors = 0;
 
         // Load weights
@@ -515,7 +514,6 @@ impl Model {
                 current_tensor: n_tensors.try_into()?,
                 tensor_count: model.tensors.len(),
             });
-            total_size += tensor.nbytes();
             n_tensors += 1;
         }
 
@@ -684,7 +682,7 @@ impl Model {
         let mut probs: Vec<f64> = logits_id
             .iter()
             .copied()
-            .map(|(k, v)| (k - maxl).exp())
+            .map(|(k, _v)| (k - maxl).exp())
             .collect();
         let sum: f64 = probs.iter().copied().sum();
 
@@ -725,7 +723,7 @@ impl Model {
         embd_w: &mut Vec<f32>,
         mem_per_token: &mut usize,
     ) {
-        let N = embd_inp.len();
+        let n = embd_inp.len();
 
         let Hyperparameters {
             n_vocab,
@@ -738,25 +736,25 @@ impl Model {
         } = self.hparams;
 
         let mut buf_size = 256 * 1024 * 1024;
-        if *mem_per_token > 0 && *mem_per_token * N > buf_size {
+        if *mem_per_token > 0 && *mem_per_token * n > buf_size {
             // add 10% to account for ggml object overhead
-            buf_size = (1.1f64 * *mem_per_token as f64 * N as f64) as usize;
+            buf_size = (1.1f64 * *mem_per_token as f64 * n as f64) as usize;
         };
         let ctx0 = ggml::Context::init(buf_size);
 
         let mut gf = ggml::ComputationGraph::new(n_threads);
 
-        let embd = ctx0.new_tensor_1d(ggml::TYPE_I32, N as i32);
+        let embd = ctx0.new_tensor_1d(ggml::TYPE_I32, n as i32);
         unsafe { embd.write_data(bytemuck::cast_slice(embd_inp)) };
 
-        let mut inpL = ctx0.op_get_rows(&self.tok_embeddings, &embd);
+        let mut inp_l = ctx0.op_get_rows(&self.tok_embeddings, &embd);
 
         for il in 0..n_layer as usize {
             let mut cur: ggml::Tensor;
 
             // norm
             {
-                cur = ctx0.op_norm(&inpL);
+                cur = ctx0.op_norm(&inp_l);
 
                 // cur = ln_1_g*cur + ln_1_b
                 cur = ctx0.op_add(
@@ -765,40 +763,40 @@ impl Model {
                 );
             }
 
-            let inpSA = cur.share();
+            let inp_sa = cur.share();
 
             // self-attention
             {
-                let Qcur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_attn_q_proj_w), &cur);
-                let Kcur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_attn_k_proj_w), &cur);
-                let Vcur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_attn_v_proj_w), &cur);
+                let q_cur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_attn_q_proj_w), &cur);
+                let k_cur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_attn_k_proj_w), &cur);
+                let v_cur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_attn_v_proj_w), &cur);
 
                 // store key and value to memory
-                if N >= 1 {
+                if n >= 1 {
                     let k = ctx0.op_view_1d(
                         &self.memory_k,
-                        N as i32 * n_embd,
+                        n as i32 * n_embd,
                         (self.memory_k.element_size() * n_embd as usize)
                             * (il * n_ctx as usize + n_past as usize),
                     );
 
                     let v = ctx0.op_view_1d(
                         &self.memory_v,
-                        N as i32 * n_embd,
+                        n as i32 * n_embd,
                         (self.memory_v.element_size() * n_embd as usize)
                             * (il * n_ctx as usize + n_past as usize),
                     );
 
-                    gf.build_forward_expand(&ctx0.op_cpy(&Kcur, &k));
-                    gf.build_forward_expand(&ctx0.op_cpy(&Vcur, &v));
+                    gf.build_forward_expand(&ctx0.op_cpy(&k_cur, &k));
+                    gf.build_forward_expand(&ctx0.op_cpy(&v_cur, &v));
                 }
 
-                // Q = Qcur.contiguous().view(n_embd/n_head, n_head, N).permute(0, 2, 1, 3)
-                let Q = ctx0.op_permute(
+                // q = qcur.contiguous().view(n_embd/n_head, n_head, n).permute(0, 2, 1, 3)
+                let q = ctx0.op_permute(
                     &ctx0.op_rope(
                         &ctx0.op_cpy(
-                            &Qcur,
-                            &ctx0.new_tensor_3d(ggml::TYPE_F32, n_embd / n_head, n_head, N as i32),
+                            &q_cur,
+                            &ctx0.new_tensor_3d(ggml::TYPE_F32, n_embd / n_head, n_head, n as i32),
                         ),
                         n_past,
                         n_rot,
@@ -807,20 +805,20 @@ impl Model {
                     0, 2, 1, 3,
                 );
 
-                // K = Kmem.view(n_embd/n_head, n_head, n_past + N).permute(0, 2, 1, 3)
-                let K = ctx0.op_permute(
+                // k = Kmem.view(n_embd/n_head, n_head, n_past + n).permute(0, 2, 1, 3)
+                let k = ctx0.op_permute(
                     &ctx0.op_rope(
                         &ctx0.op_reshape_3d(
                             &ctx0.op_view_1d(
                                 &self.memory_k,
-                                (n_past + N as i32) * n_embd,
+                                (n_past + n as i32) * n_embd,
                                 il * n_ctx as usize
                                     * self.memory_k.element_size()
                                     * n_embd as usize,
                             ),
                             n_embd / n_head,
                             n_head,
-                            n_past + N as i32,
+                            n_past + n as i32,
                         ),
                         n_past,
                         n_rot,
@@ -829,32 +827,32 @@ impl Model {
                     0, 2, 1, 3,
                 );
 
-                // K * Q
-                let KQ = ctx0.op_mul_mat(&K, &Q);
+                // k * q
+                let kq = ctx0.op_mul_mat(&k, &q);
 
-                // KQ_scaled = KQ / sqrt(n_embd/n_head)
-                let KQ_scaled = ctx0.op_scale(
-                    &KQ,
+                // kq_scaled = kq / sqrt(n_embd/n_head)
+                let kq_scaled = ctx0.op_scale(
+                    &kq,
                     &ctx0.new_f32(1.0 / f32::sqrt(n_embd as f32 / n_head as f32)),
                 );
 
-                // KQ_masked = mask_past(KQ_scaled)
-                let KQ_masked = ctx0.op_diag_mask_inf(&KQ_scaled, n_past);
+                // kq_masked = mask_past(kq_scaled)
+                let kq_masked = ctx0.op_diag_mask_inf(&kq_scaled, n_past);
 
-                // KQ = soft_max(KQ_masked)
-                let KQ_soft_max = ctx0.op_soft_max(&KQ_masked);
+                // kq = soft_max(kq_masked)
+                let kq_soft_max = ctx0.op_soft_max(&kq_masked);
 
-                // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
-                let V_trans = ctx0.op_permute(
+                // v_trans = Vmem.view(n_embd/n_head, n_head, n_past + n).permute(1, 2, 0, 3).contiguous()
+                let v_trans = ctx0.op_permute(
                     &ctx0.op_reshape_3d(
                         &ctx0.op_view_1d(
                             &self.memory_v,
-                            (n_past + N as i32) * n_embd,
+                            (n_past + n as i32) * n_embd,
                             il * n_ctx as usize * self.memory_v.element_size() * n_embd as usize,
                         ),
                         n_embd / n_head,
                         n_head,
-                        n_past + N as i32,
+                        n_past + n as i32,
                     ),
                     1,
                     2,
@@ -862,29 +860,29 @@ impl Model {
                     3,
                 );
 
-                // KQV = transpose(V) * KQ_soft_max
-                let KQV = ctx0.op_mul_mat(&V_trans, &KQ_soft_max);
+                // kqv = transpose(V) * kq_soft_max
+                let kqv = ctx0.op_mul_mat(&v_trans, &kq_soft_max);
 
-                // KQV_merged = KQV.permute(0, 2, 1, 3)
-                let KQV_merged = ctx0.op_permute(&KQV, 0, 2, 1, 3);
+                // kqv_merged = kqv.permute(0, 2, 1, 3)
+                let kqv_merged = ctx0.op_permute(&kqv, 0, 2, 1, 3);
 
-                // cur = KQV_merged.contiguous().view(n_embd, N)
+                // cur = kqv_merged.contiguous().view(n_embd, n)
                 cur = ctx0.op_cpy(
-                    &KQV_merged,
-                    &ctx0.new_tensor_2d(ggml::TYPE_F32, n_embd, N as i32),
+                    &kqv_merged,
+                    &ctx0.new_tensor_2d(ggml::TYPE_F32, n_embd, n as i32),
                 );
 
                 // projection (no bias)
                 cur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_attn_proj_w), &cur);
             }
 
-            //let inpFF = ctx0.op_add(&cur, &inpSA);
-            let inpFF = cur.share();
+            //let inp_ff = ctx0.op_add(&cur, &inp_sa);
+            let inp_ff = cur.share();
 
             // feed-forward network
             {
-                // note here we pass inpSA instead of cur
-                cur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_mlp_fc_w), &inpSA);
+                // note here we pass inp_sa instead of cur
+                cur = ctx0.op_mul_mat(&ctx0.op_transpose(&self.layers[il].c_mlp_fc_w), &inp_sa);
                 cur = ctx0.op_add(&ctx0.op_repeat(&self.layers[il].c_mlp_fc_b, &cur), &cur);
 
                 // GELU activation
@@ -897,49 +895,49 @@ impl Model {
             }
 
             // self-attention + FF
-            cur = ctx0.op_add(&cur, &inpFF);
+            cur = ctx0.op_add(&cur, &inp_ff);
 
             // input for next layer
-            //inpL = cur;
-            inpL = ctx0.op_add(&cur, &inpL);
+            //inp_l = cur;
+            inp_l = ctx0.op_add(&cur, &inp_l);
         }
 
         // norm
         {
-            inpL = ctx0.op_norm(&inpL);
+            inp_l = ctx0.op_norm(&inp_l);
 
-            // inpL = ln_f_g*inpL + ln_f_b
-            inpL = ctx0.op_add(
-                &ctx0.op_mul(&ctx0.op_repeat(&self.ln_f_g, &inpL), &inpL),
-                &ctx0.op_repeat(&self.ln_f_b, &inpL)
+            // inp_l = ln_f_g*inp_l + ln_f_b
+            inp_l = ctx0.op_add(
+                &ctx0.op_mul(&ctx0.op_repeat(&self.ln_f_g, &inp_l), &inp_l),
+                &ctx0.op_repeat(&self.ln_f_b, &inp_l)
             )
         }
 
         // lm_head
         {
-            inpL = ctx0.op_mul_mat(&self.lmh_g, &inpL);
-            inpL = ctx0.op_add(&ctx0.op_repeat(&self.lmh_b, &inpL), &inpL);
+            inp_l = ctx0.op_mul_mat(&self.lmh_g, &inp_l);
+            inp_l = ctx0.op_add(&ctx0.op_repeat(&self.lmh_b, &inp_l), &inp_l);
         }
 
         // logits -> probs
-        // inpL = ctx0.op_soft_max(&inpL);
+        // inp_l = ctx0.op_soft_max(&inp_l);
 
         // run the computation
-        gf.build_forward_expand(&inpL);
+        gf.build_forward_expand(&inp_l);
         ctx0.graph_compute(&mut gf);
 
         // return result for just the last token
         embd_w.resize(n_vocab as usize, 0.0);
         // SAFETY: yolo
         unsafe {
-            inpL.read_data(
-                n_vocab as usize * (N - 1) * std::mem::size_of::<f32>(),
+            inp_l.read_data(
+                n_vocab as usize * (n - 1) * std::mem::size_of::<f32>(),
                 bytemuck::cast_slice_mut(embd_w),
             )
         };
 
         if *mem_per_token == 0 {
-            *mem_per_token = ctx0.used_mem() / N;
+            *mem_per_token = ctx0.used_mem() / n;
         }
     }
 
